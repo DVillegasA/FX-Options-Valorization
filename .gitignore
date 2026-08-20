@@ -16,13 +16,15 @@ data/*
 salidas/*
 !salidas/.gitkeep
 
+# Estado persistente del seguimiento de cambios (foto de la cartera vigente;
+# contiene datos de cartera, es tan confidencial como data/ y salidas/)
+estado/*
+!estado/.gitkeep
+
 # Archivos de mercado / cartera sueltos (por si quedan en la raíz)
 *.xlsx
 *.xlsm
 *.csv
-
-# Resúmenes del proceso diario (donde sea que se generen)
-resumen_*.txt
 
 # Excepción: datos de mercado de prueba (no sensibles) sí se versionan
 !tests/data/*.xlsx

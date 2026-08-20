@@ -15,7 +15,7 @@ que vencen en la fecha de proceso usando el fixing USDOBS, y genera:
 Uso:
   python daily_process.py <grid.xlsx> <operaciones.xlsx> [YYYY-MM-DD] [dir_salida]
 """
-import sys, os, re
+import sys, os, re, json
 from datetime import date, datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -65,6 +65,122 @@ def clasificar(ops, fecha_proceso):
     vencen = [o for o in ops if o["venc"] == fecha_proceso]
     altas = [o for o in ops if o["inicio"] == fecha_proceso]
     return vigentes, vencen, altas
+
+
+# --------------------------------------------------------------------------
+# Seguimiento de cambios en operaciones ya vigentes. Se persiste una "foto"
+# (JSON) de la cartera vigente por CADA fecha de proceso ya corrida (carpeta
+# estado/, un archivo por fecha), y la base de comparacion de una corrida es
+# siempre la foto de la ultima fecha estrictamente anterior a la que se esta
+# procesando -nunca la de la misma fecha, aunque ya exista-. Asi, reprocesar
+# una misma fecha (por error o correccion de los inputs) no compara "hoy"
+# contra un intento previo de "hoy" ni pierde la base real del dia anterior.
+# --------------------------------------------------------------------------
+CAMPOS_SEGUIMIENTO = [
+    "contraparte", "lado", "tipo", "modalidad", "entrega", "moneda",
+    "nominal", "strike", "par", "venc",
+]
+_ETIQUETA_CAMPO = {
+    "contraparte": "Contraparte", "lado": "Lado Nevasa", "tipo": "Tipo",
+    "modalidad": "Tipo Modalidad", "entrega": "Tipo Entrega",
+    "moneda": "Moneda Principal", "nominal": "Monto Principal",
+    "strike": "Strike", "par": "Par de Monedas", "venc": "Fecha Vencimiento",
+}
+
+
+def _valor_serializable(campo, v):
+    """Convierte un valor de operacion a algo guardable en JSON."""
+    if isinstance(v, (date, datetime)):
+        d = v.date() if isinstance(v, datetime) else v
+        return d.isoformat()
+    return v
+
+
+def _valor_comparable(campo, v):
+    """Normaliza un valor (recien leido o recuperado del JSON) para comparar."""
+    if campo == "venc":
+        return _valor_serializable(campo, v)
+    if isinstance(v, str):
+        return v.strip()
+    return v
+
+
+def _foto_cartera(vigentes):
+    """Snapshot serializable de los campos a seguir, por folio."""
+    return {o["folio"]: {c: _valor_serializable(c, o.get(c)) for c in CAMPOS_SEGUIMIENTO}
+            for o in vigentes}
+
+
+_PAT_ESTADO_FECHA = re.compile(r"^estado_cartera_(\d{8})\.json$")
+
+
+def _ruta_estado_fecha(carpeta_estado, fecha_proceso):
+    return os.path.join(carpeta_estado, f"estado_cartera_{fecha_proceso:%Y%m%d}.json")
+
+
+def _cargar_estado_anterior(carpeta_estado, fecha_proceso):
+    """Foto de la cartera vigente de la ultima fecha de proceso ya corrida
+    ESTRICTAMENTE anterior a fecha_proceso (nunca la de la misma fecha, para
+    que reprocesar una fecha no se compare consigo misma)."""
+    if not os.path.isdir(carpeta_estado):
+        return None
+    anteriores = []
+    for nombre in os.listdir(carpeta_estado):
+        m = _PAT_ESTADO_FECHA.match(nombre)
+        if not m:
+            continue
+        f = datetime.strptime(m.group(1), "%Y%m%d").date()
+        if f < fecha_proceso:
+            anteriores.append((f, nombre))
+    if not anteriores:
+        return None
+    anteriores.sort()
+    _, nombre = anteriores[-1]
+    with open(os.path.join(carpeta_estado, nombre), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _guardar_estado_cartera(carpeta_estado, foto, fecha_proceso):
+    """Guarda (o sobrescribe, si se reprocesa) la foto de fecha_proceso. Al ser
+    un archivo propio por fecha, sobrescribirlo no afecta la comparacion de esa
+    misma corrida (que ya uso la foto del dia anterior antes de llegar aqui)."""
+    os.makedirs(carpeta_estado, exist_ok=True)
+    with open(_ruta_estado_fecha(carpeta_estado, fecha_proceso), "w", encoding="utf-8") as f:
+        json.dump({"fecha_proceso": fecha_proceso.isoformat(), "operaciones": foto},
+                   f, indent=2, ensure_ascii=False)
+
+
+def _detectar_cambios(estado_anterior, ops_hoy, vigentes_hoy, fecha_proceso):
+    """Compara la foto de la corrida anterior contra la cartera de hoy y devuelve
+    avisos: (a) cambios de datos en operaciones que ya estaban vigentes, y
+    (b) liquidaciones anticipadas (folios que debian seguir vigentes -vencimiento
+    posterior a hoy- y desaparecieron de la cartera sin llegar a su vencimiento)."""
+    if estado_anterior is None:
+        return []          # primera ejecucion: no hay base de comparacion aun
+
+    avisos = []
+    anteriores = estado_anterior.get("operaciones", {})
+    folios_hoy = {o["folio"] for o in ops_hoy}
+    vigentes_por_folio = {o["folio"]: o for o in vigentes_hoy}
+
+    for folio, campos_antes in anteriores.items():
+        if folio in vigentes_por_folio:
+            o = vigentes_por_folio[folio]
+            for campo in CAMPOS_SEGUIMIENTO:
+                antes = _valor_comparable(campo, campos_antes.get(campo))
+                despues = _valor_comparable(campo, o.get(campo))
+                if antes != despues:
+                    avisos.append(
+                        f"Folio {folio}: cambio de {_ETIQUETA_CAMPO[campo]} "
+                        f"de '{campos_antes.get(campo)}' a "
+                        f"'{_valor_serializable(campo, o.get(campo))}'.")
+        elif folio not in folios_hoy:
+            venc_antes = campos_antes.get("venc")
+            if venc_antes and date.fromisoformat(venc_antes) > fecha_proceso:
+                avisos.append(
+                    f"Folio {folio}: liquidada anticipadamente (no aparece en la "
+                    f"cartera de hoy; su vencimiento original era {venc_antes}).")
+    return avisos
 
 
 def _fx_prima(op, universo):
@@ -449,7 +565,8 @@ def _auto_width(ws, ncols):
 
 
 # --------------------------------------------------------------------------
-def procesar(grid_path, ops_path, fecha_proceso=None, out_dir="salidas"):
+def procesar(grid_path, ops_path, fecha_proceso=None, out_dir="salidas",
+             estado_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     if fecha_proceso is None:
         # fecha de proceso desde el nombre del archivo de cartera
@@ -463,26 +580,56 @@ def procesar(grid_path, ops_path, fecha_proceso=None, out_dir="salidas"):
     fecha_proceso = md.fecha_proceso
     vigentes, vencen, altas = clasificar(ops, fecha_proceso)
 
+    # seguimiento de cambios en operaciones ya vigentes (contraparte, monto,
+    # strike, vencimiento, etc.) y liquidaciones anticipadas, contra la foto
+    # de la cartera vigente de la fecha anterior. Se guarda en una carpeta
+    # propia ("estado/", junto a data/ y salidas/) para que sobreviva aunque
+    # se limpie/archive salidas/ periodicamente, con un archivo por fecha
+    # (reprocesar la misma fecha no altera la base de comparacion).
+    if estado_dir is None:
+        estado_dir = os.path.join(os.path.dirname(os.path.abspath(out_dir)), "estado")
+    estado_anterior = _cargar_estado_anterior(estado_dir, fecha_proceso)
+    avisos += _detectar_cambios(estado_anterior, ops, vigentes, fecha_proceso)
+
     resultados = [_op_obj(o).valorizar(md) for o in vigentes]
     _enriquecer_pl(vigentes, resultados)
+    # si algun vencimiento no trae el fixing USDOBS informado en la cartera
+    # (ej. el USD Observado del dia aun no estaba publicado), se usa el spot
+    # de la planilla de datos de mercado como reemplazo, y se deja constancia
+    # en los avisos -no se detiene el proceso completo por esto.
     sin_fixing = [o["folio"] for o in vencen
                   if not isinstance(o.get("usdobs"), (int, float))]
     if sin_fixing:
-        raise ValueError("vencimientos sin fixing USDOBS en el archivo de "
-                         "cartera: " + ", ".join(sin_fixing))
-    liqs = [liquidar_vencimiento(_op_obj(o), o["usdobs"]) for o in vencen]
+        avisos.append(
+            f"vencimientos sin fixing USDOBS informado en la cartera: "
+            f"{', '.join(sin_fixing)}. Se usó el USDCLP observado (spot) de "
+            f"la fecha de proceso ({md.spot:,.2f}) en su lugar.")
+    liqs = [liquidar_vencimiento(_op_obj(o), o["usdobs"]
+                                  if isinstance(o.get("usdobs"), (int, float))
+                                  else md.spot)
+            for o in vencen]
 
     tag = fecha_proceso.strftime("%Y%m%d")
     p_mtm = os.path.join(out_dir, f"MtM_{tag}.xlsx")
-    p_ven = os.path.join(out_dir, f"MtM_{tag}_vencimientos.xlsx")
     p_res = os.path.join(out_dir, f"resumen_{tag}.txt")
     escribir_mtm(vigentes, resultados, md, p_mtm, fecha_proceso)
-    escribir_vencimientos(vencen, liqs, p_ven, fecha_proceso)
+    # sin vencimientos ese dia, no se genera el archivo (nada que informar).
+    if vencen:
+        p_ven = os.path.join(out_dir, f"MtM_{tag}_vencimientos.xlsx")
+        escribir_vencimientos(vencen, liqs, p_ven, fecha_proceso)
+    else:
+        p_ven = None
 
     n_itm = sum(1 for l in liqs if l["itm"])
     tot_mtm = sum(r["mtm"] for r in resultados)
     tot_pl = sum(r["pl_clp"] for r in resultados)
     tot_flujo = sum(l["flujo_pago_clp"] for l in liqs)
+    # flujo_pago_clp > 0 = Nevasa recibe (lado Compra); < 0 = Nevasa paga (lado
+    # Venta). El neto puede salir 0 con operaciones calzadas aunque haya flujos
+    # reales de caja con contrapartes distintas, por eso se informa tambien el
+    # bruto recibido/pagado.
+    tot_recibido = sum(l["flujo_pago_clp"] for l in liqs if l["flujo_pago_clp"] > 0)
+    tot_pagado = -sum(l["flujo_pago_clp"] for l in liqs if l["flujo_pago_clp"] < 0)
     resumen = (
         f"Proceso de Valorización Opciones FX para el {fecha_proceso:%d-%m-%Y}\n"
         f"{'='*54}\n"
@@ -494,20 +641,30 @@ def procesar(grid_path, ops_path, fecha_proceso=None, out_dir="salidas"):
            f"Vencieron {len(vencen)} operaciones, {n_itm} ITM por lo que hay "
            f"flujos de pago.\n")
         + f"Hay {len(vigentes)} operaciones vigentes.\n\n"
-        f"MtM total cartera         : {tot_mtm:,.0f} CLP\n"
-        f"P&L no realizado total    : {tot_pl:,.0f} CLP\n"
-        f"Flujo de pago vencimientos: {tot_flujo:,.0f} CLP\n"
+        f"MtM total cartera                 : {tot_mtm:,.0f} CLP\n"
+        f"P&L no realizado total            : {tot_pl:,.0f} CLP\n"
+        f"Flujo de pago vencimientos (neto) : {tot_flujo:,.0f} CLP\n"
+        f"  Recibido: {tot_recibido:,.0f} CLP\n"
+        f"  Pagado  : {tot_pagado:,.0f} CLP\n"
     )
     if altas:
-        resumen += f"\nAltas del dia: {', '.join(o['folio'] for o in altas)}\n"
+        resumen += f"\nAltas del día: {', '.join(o['folio'] for o in altas)}\n"
     if avisos:
         resumen += "\nAvisos:\n" + "\n".join("  - " + a for a in avisos) + "\n"
     with open(p_res, "w", encoding="utf-8") as f:
         f.write(resumen)
+
+    # la cartera vigente de hoy queda como base de comparacion para la corrida
+    # de manana (solo se guarda si todo el proceso termino sin errores). Si se
+    # reprocesa esta misma fecha, esto solo sobrescribe su propia foto: no
+    # afecta la comparacion que ya se hizo mas arriba contra el dia anterior.
+    _guardar_estado_cartera(estado_dir, _foto_cartera(vigentes), fecha_proceso)
+
+    archivos = [p_mtm] + ([p_ven] if p_ven else []) + [p_res]
     return dict(fecha=fecha_proceso, vigentes=len(vigentes), vencen=len(vencen),
                 itm=n_itm, altas=len(altas), tot_mtm=tot_mtm, tot_pl=tot_pl,
-                tot_flujo=tot_flujo, avisos=avisos,
-                archivos=[p_mtm, p_ven, p_res], resumen=resumen)
+                tot_flujo=tot_flujo, tot_recibido=tot_recibido, tot_pagado=tot_pagado,
+                avisos=avisos, archivos=archivos, resumen=resumen)
 
 
 if __name__ == "__main__":
