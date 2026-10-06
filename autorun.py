@@ -12,7 +12,7 @@ inbox = outlook.GetDefaultFolder(6)
 messages = inbox.Items
 messages.Sort("[ReceivedTime]", True)
 attachment_files = []
-sender_email = os.getenv("SENDER_EMAIL")
+sender_emails = os.getenv("SENDER_EMAILS")
 subject_email = os.getenv("SUBJECT_EMAIL")
 
 parser = argparse.ArgumentParser(description="Script para ejecución automática del proceso de Valorización de opciones FX de Nevasa.")
@@ -31,7 +31,7 @@ def reply_mail(original_mail, message, attachments: list):
 
 for i in range(100):
     msg = messages[i]
-    if subject_email in msg.Subject and msg.SenderEmailAddress == sender_email and msg.Attachments.Count > 0:
+    if subject_email in msg.Subject and msg.SenderEmailAddress in sender_emails and msg.Attachments.Count > 0:
         re_process_date = re.search(r" (\d{4})_(\d{2})_(\d{2})", msg.Subject)
         process_date = f"{re_process_date.group(1)}{re_process_date.group(2)}{re_process_date.group(3)}"
         input_path = os.path.join(os.getcwd(), "data", process_date)
